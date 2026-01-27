@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>IoT – Régression Linéaire</title>
+  <link rel="icon" href="data:,">
+  <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-database-compat.js"></script>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    :root{ --blue:#007bff; --shadow:0 2px 10px rgba(0,0,0,.1); }
+    body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; color:#333; }
+    h1 { text-align: center; margin-bottom: 10px; }
+    h2 { color: #555; border-bottom: 2px solid var(--blue); padding-bottom: 10px; margin-top:28px; }
+    #map { height: 380px; margin: 20px 0; border: 2px solid var(--blue); border-radius: 10px; }
+    .gauge-container { display: flex; justify-content: center; gap: 16px; flex-wrap: wrap; margin: 20px 0; }
+    .gauge { width: 220px; height: 220px; background: #fff; border-radius: 12px; padding: 12px; box-shadow: var(--shadow); }
+    .gauge-title { text-align:center; font-weight:bold; margin-top:8px; }
+    table { border-collapse: collapse; width: 100%; margin: 20px 0; background: white; box-shadow: var(--shadow); }
+    th, td { border: 1px solid #ddd; padding: 10px; text-align: center; }
+    th { background: var(--blue); color: white; }
+    .panel { background: white; padding: 20px; border-radius: 10px; box-shadow: var(--shadow); margin: 20px 0; }
+    .alert { position: fixed; top: 20px; left: 50%; transform: translateX(-50%); background: #ff0033; color: white; padding: 12px 20px; font-size: 18px; border-radius: 14px; box-shadow: 0 0 30px red; z-index: 9999; display: none; }
+    #prediction { font-size: 18px; font-weight: bold; text-align: center; margin: 12px 0; }
+    .btn { padding:10px 16px; font-size:15px; background:#d9534f; color:#fff; border:none; border-radius:6px; cursor:pointer; box-shadow: var(--shadow); }
+    .muted { color:#777; font-size: 13px; text-align:center }
+  </style>
+</head>
+<body>
+  <h1>IoT – Régression Linéaire</h1>
+  <p class="muted">Firebase RTDB + modèle linéaire JSON (entrainé sur US_Accidents_March23)</p>
+
+  <div class="alert" id="alert">ZONE DANGEREUSE !</div>
+
+  <h2>Position GPS</h2>
+  <div id="map"></div>
+
+  <h2>Jauges</h2>
+  <div class="gauge-container">
+    <div class="gauge">
+      <canvas id="tempGauge"></canvas>
+      <div class="gauge-title">Température (°C)</div>
+    </div>
+    <div class="gauge">
+      <canvas id="humGauge"></canvas>
+      <div class="gauge-title">Humidité (%)</div>
+    </div>
+  </div>
+
+  <h2>Données actuelles</h2>
+  <div class="panel">
+    <table>
+      <tr><td><strong>Latitude</strong></td><td id="currentLat">-</td></tr>
+      <tr><td><strong>Longitude</strong></td><td id="currentLng">-</td></tr>
+      <tr><td><strong>Altitude</strong></td><td id="currentAlt">-</td></tr>
+      <tr><td><strong>Température</strong></td><td id="currentTemp">-</td></tr>
+      <tr><td><strong>Humidité</strong></td><td id="currentHum">-</td></tr>
+      <tr><td><strong>Dernière mesure</strong></td><td id="currentTime">-</td></tr>
+    </table>
+    <div class="muted">Modèle: <span id="modelStatus">chargement…</span> — Scaler: <span id="scalerStatus">chargement…</span></div>
+  </div>
+
+  <h2>Historique (10 dernières)</h2>
+  <table id="historique">
+    <thead><tr><th>Timestamp</th><th>Lat</th><th>Lng</th><th>Alt</th><th>T°</th><th>H%</th></tr></thead>
+    <tbody></tbody>
+  </table>
+
+  <h2>Prédiction (linéaire)</h2>
+  <div id="prediction">Modèle non chargé</div>
+  <div style="text-align:center; margin:8px 0;">
+    <button class="btn" id="predictBtn">Prédire</button>
+  </div>
+
+  <script>
+    const CONFIG = {
+      RTDB_URL: "https://projet-iot-f4017-default-rtdb.europe-west1.firebasedatabase.app/",
+      SCALER_URLS: ["https://siwarhaddad.github.io/IOT/model/scaler.json"],
+      LR_URLS: ["https://siwarhaddad.github.io/IOT/model/lr_linear.json"],
+      BEEP_URL: "https://www.soundjay.com/buttons/beep-01a.mp3"
+    };
+
+    firebase.initializeApp({ databaseURL: CONFIG.RTDB_URL });
+    const db = firebase.database();
+
+    const map = L.map('map').setView([36.8065, 10.1815], 15);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{attribution:'&copy; OpenStreetMap'}).addTo(map);
+    const marker = L.marker([36.8065, 10.1815]).addTo(map);
+
+    const tempGauge = new Chart(document.getElementById('tempGauge'), {
+      type: 'doughnut',
+      data: { datasets: [{ data: [0,100], backgroundColor: ['#ff6b6b','#e0e0e0'] }] },
+      options: { cutout:'70%', plugins:{ legend:{ display:false } } }
+    });
+    const humGauge = new Chart(document.getElementById('humGauge'), {
+      type: 'doughnut',
+      data: { datasets: [{ data: [0,100], backgroundColor: ['#4ecdc4','#e0e0e0'] }] },
+      options: { cutout:'70%', plugins:{ legend:{ display:false } } }
+    });
+
+    let allData = [];
+    let zonesRisque = {};
+    let scaler = null;
+    let LR = null;
+
+    const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
+    const safe = v => { const x = parseFloat(v); return Number.isFinite(x) ? x : 0; };
+    const zoneKey = (lat,lng) => `${(safe(lat)).toFixed(3)}_${(safe(lng)).toFixed(3)}`;
+    function approxSpeedKmh(){
+      if (allData.length < 2) return 60;
+      const a=allData[0], b=allData[1];
+      if(!a.latitude||!a.longitude||!b.latitude||!b.longitude) return 60;
+      const R=6371e3, rad=d=>d*Math.PI/180;
+      const φ1=rad(safe(a.latitude)), φ2=rad(safe(b.latitude));
+      const Δφ=φ2-φ1, Δλ=rad(safe(a.longitude)-safe(b.longitude));
+      const s=2*R*Math.asin(Math.sqrt(Math.sin(Δφ/2)**2 + Math.cos(φ1)*Math.cos(φ2)*Math.sin(Δλ/2)**2));
+      const tA=Date.parse(a.timestamp)||0, tB=Date.parse(b.timestamp)||0;
+      const dt=Math.max(1, Math.abs(tA-tB)/1000);
+      return (s/dt)*3.6;
+    }
+    async function fetchJSON(u){ const r=await fetch(u,{cache:'no-store'}); if(!r.ok) throw new Error(r.statusText); return r.json(); }
+    async function firstOk(fn, urls){
+      const errs=[]; for(const u of urls){ try{ const out=await fn(u); return {url:u,out}; } catch(e){ errs.push({u,e:String(e)}) } }
+      throw new Error("Aucune URL valide: "+JSON.stringify(errs));
+    }
+
+    (async function initML(){
+      const sEl = document.getElementById('scalerStatus');
+      const mEl = document.getElementById('modelStatus');
+      try { const p = await firstOk(fetchJSON, CONFIG.SCALER_URLS); scaler = p.out; sEl.textContent = "OK"; }
+      catch(e){ sEl.textContent = "absent"; scaler = null; }
+      try { const p = await firstOk(fetchJSON, CONFIG.LR_URLS); LR = p.out; mEl.textContent = "OK"; }
+      catch(e){ mEl.textContent = "fallback"; LR = { w:[0.4,0.35,0.05,0.15,0.3,0.1], b:0.05 }; }
+      document.getElementById('prediction').textContent = "Modèle prêt";
+    })();
+
+    db.ref('historique').on('value', (snap)=>{
+      const v=snap.val(); if(!v) return;
+      const rows=[];
+      Object.values(v).forEach(x=>{
+        if(x && x.timestamp) rows.push(x);
+        else if(x && typeof x==="object") Object.values(x).forEach(y=>y?.timestamp&&rows.push(y));
+      });
+      rows.sort((a,b)=>(Date.parse(b.timestamp)||0)-(Date.parse(a.timestamp)||0));
+      allData = rows.slice(0,150);
+
+      const d=allData[0]||{};
+      const temp=safe(d.temperature), hum=safe(d.humidity), alt=safe(d.altitude);
+      document.getElementById('currentLat').textContent = d.latitude??'-';
+      document.getElementById('currentLng').textContent = d.longitude??'-';
+      document.getElementById('currentAlt').textContent = Number.isFinite(alt)?alt.toFixed(1):'-';
+      document.getElementById('currentTemp').textContent= Number.isFinite(temp)?temp.toFixed(1):'-';
+      document.getElementById('currentHum').textContent = Number.isFinite(hum)?hum.toFixed(1):'-';
+      document.getElementById('currentTime').textContent = d.timestamp||'-';
+
+      tempGauge.data.datasets[0].data=[clamp(temp,0,100),100-clamp(temp,0,100)];
+      humGauge.data.datasets[0].data =[clamp(hum,0,100), 100-clamp(hum,0,100)];
+      tempGauge.update('none'); humGauge.update('none');
+
+      if(d.latitude && d.longitude && d.latitude!=="N/A"){
+        const pos=[safe(d.latitude), safe(d.longitude)];
+        marker.setLatLng(pos); map.setView(pos,16);
+      }
+      renderHistory();
+    });
+
+    db.ref('stats').on('value',(snap)=>{
+      const s=snap.val()||{};
+      zonesRisque = s.zonesRisque || {};
+    });
+
+    function renderHistory(){
+      const tb=document.querySelector('#historique tbody'); tb.innerHTML="";
+      allData.slice(0,10).forEach(d=>{
+        const tr=document.createElement('tr');
+        tr.innerHTML = `
+          <td>${d.timestamp||'-'}</td>
+          <td>${d.latitude||'-'}</td>
+          <td>${d.longitude||'-'}</td>
+          <td>${Number.isFinite(safe(d.altitude))?safe(d.altitude).toFixed(1):'-'}</td>
+          <td>${Number.isFinite(safe(d.temperature))?safe(d.temperature).toFixed(1):'-'}</td>
+          <td>${Number.isFinite(safe(d.humidity))?safe(d.humidity).toFixed(1):'-'}</td>`;
+        tb.appendChild(tr);
+      });
+    }
+
+    function predict(){
+      if(!LR || allData.length===0){ document.getElementById('prediction').textContent="Modèle indisponible"; return; }
+      const d=allData[0];
+      const temp=safe(d.temperature), hum=safe(d.humidity), alt=safe(d.altitude);
+      const hour = (()=>{ const t=Date.parse(d.timestamp); return Number.isFinite(t)? new Date(t).getUTCHours() : new Date().getUTCHours(); })();
+      const spd  = approxSpeedKmh();
+      const dens = (()=>{ const z = (d.latitude&&d.longitude)? zoneKey(d.latitude,d.longitude):""; return zonesRisque[z]||0; })();
+
+      let x=[temp,hum,alt,spd,dens,hour];
+      if(scaler && Array.isArray(scaler.mean) && Array.isArray(scaler.std) && scaler.mean.length===6){
+        x = x.map((v,i)=> (v - scaler.mean[i]) / (scaler.std[i] || 1));
+      } else {
+        x = [(temp-20)/20, (hum-50)/30, (alt-50)/100, (spd-50)/50, (dens>2?1:0), hour/24];
+      }
+
+      const w=LR.w||[0,0,0,0,0,0], b=Number(LR.b||0);
+      const p = clamp(w.reduce((s,wi,i)=> s + wi*(x[i]||0), 0) + b, 0, 1);
+
+      const level = p>0.7? "ÉLEVÉ" : p>0.4? "MODÉRÉ" : "FAIBLE";
+      const color = p>0.7? "#d9534f" : p>0.4? "#f0ad4e" : "#5cb85c";
+      document.getElementById('prediction').innerHTML = `<span style="color:${color}">RISQUE ${level}</span> — ${(p*100).toFixed(1)}%`;
+      document.getElementById('alert').style.display = p>0.7?"block":"none";
+      if(p>0.7) new Audio(CONFIG.BEEP_URL).play().catch(()=>{});
+    }
+
+    document.getElementById('predictBtn').addEventListener('click', predict);
+  </script>
+</body>
+</html>
